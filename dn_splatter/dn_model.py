@@ -30,25 +30,21 @@ try:
     from gsplat.rendering import rasterization
 except ImportError:
     print("Please install gsplat>=1.0.0")
-from gsplat import rasterize_gaussians
-from gsplat.cuda_legacy._torch_impl import quat_to_rotmat
-from gsplat.cuda_legacy._wrapper import num_sh_bases
+from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.scene_box import OrientedBox
-from nerfstudio.engine.callbacks import (
-    TrainingCallback,
-    TrainingCallbackAttributes,
-    TrainingCallbackLocation,
-)
 from nerfstudio.engine.optimizers import Optimizers
 from nerfstudio.models.splatfacto import (
     RGB2SH,
     SplatfactoModel,
     SplatfactoModelConfig,
     get_viewmat,
+    num_sh_bases,
 )
+from nerfstudio.model_components.lib_bilagrid import BilateralGrid, total_variation_loss
 from nerfstudio.utils.colors import get_color
+from nerfstudio.utils.math import k_nearest_sklearn
 from nerfstudio.utils.rich_utils import CONSOLE
 
 
@@ -134,8 +130,6 @@ class DNSplatterModel(SplatfactoModel):
         else:
             means = torch.nn.Parameter((torch.rand((500000, 3)) - 0.5) * 10)
         CONSOLE.log(f"Number of initial seed points {means.shape[0]}")
-        self.xys_grad_norm = None
-        self.max_2Dsize = None
         dim_sh = num_sh_bases(self.config.sh_degree)
         num_points = means.shape[0]
 
@@ -183,7 +177,7 @@ class DNSplatterModel(SplatfactoModel):
         self.rgb_metrics = RGBMetrics()
         self.depth_metrics = DepthMetrics()
         self.normal_metrics = NormalMetrics()
-        distances, indices = self.k_nearest_sklearn(means.data, 3)
+        distances, indices = k_nearest_sklearn(means.data, 3)
         distances = torch.from_numpy(distances)
         # find the average of the three nearest neighbors for each point and use that as the scale
         avg_dist = distances.mean(dim=-1, keepdim=True)
@@ -264,126 +258,55 @@ class DNSplatterModel(SplatfactoModel):
         if not self.config.use_normal_loss:
             self.regularization_strategy.normal_loss = None
 
+        # Strategy for GS densification (ns>=1.1.4 / gsplat>=1.0 API; replaces the
+        # 1.1.3-era refinement_after/split_gaussians/cull_gaussians logic).
+        if self.config.strategy == "default":
+            self.strategy = DefaultStrategy(
+                prune_opa=self.config.cull_alpha_thresh,
+                grow_grad2d=self.config.densify_grad_thresh,
+                grow_scale3d=self.config.densify_size_thresh,
+                grow_scale2d=self.config.split_screen_size,
+                prune_scale3d=self.config.cull_scale_thresh,
+                prune_scale2d=self.config.cull_screen_size,
+                refine_scale2d_stop_iter=self.config.stop_screen_size_at,
+                refine_start_iter=self.config.warmup_length,
+                refine_stop_iter=self.config.stop_split_at,
+                reset_every=self.config.reset_alpha_every * self.config.refine_every,
+                refine_every=self.config.refine_every,
+                pause_refine_after_reset=self.num_train_data + self.config.refine_every,
+                absgrad=self.config.use_absgrad,
+                revised_opacity=False,
+                verbose=True,
+            )
+            self.strategy_state = self.strategy.initialize_state(scene_scale=1.0)
+        elif self.config.strategy == "mcmc":
+            self.strategy = MCMCStrategy(
+                cap_max=self.config.max_gs_num,
+                noise_lr=self.config.noise_lr,
+                refine_start_iter=self.config.warmup_length,
+                refine_stop_iter=self.config.stop_split_at,
+                refine_every=self.config.refine_every,
+                min_opacity=self.config.cull_alpha_thresh,
+                verbose=False,
+            )
+            self.strategy_state = self.strategy.initialize_state()
+        else:
+            raise ValueError(
+                f"DNSplatter does not support strategy {self.config.strategy}. "
+                "Currently, the supported strategies include default and mcmc."
+            )
+
+        if self.config.use_bilateral_grid:
+            self.bil_grids = BilateralGrid(
+                num=self.num_train_data,
+                grid_X=self.config.grid_shape[0],
+                grid_Y=self.config.grid_shape[1],
+                grid_W=self.config.grid_shape[2],
+            )
+
     @property
     def normals(self):
         return self.gauss_params["normals"]
-
-    def refinement_after(self, optimizers: Optimizers, step):
-        assert step == self.step
-        if self.step <= self.config.warmup_length:
-            return
-        with torch.no_grad():
-            # Offset all the opacity reset logic by refine_every so that we don't
-            # save checkpoints right when the opacity is reset (saves every 2k)
-            # then cull
-            # only split/cull if we've seen every image since opacity reset
-            reset_interval = self.config.reset_alpha_every * self.config.refine_every
-            do_densification = (
-                self.step < self.config.stop_split_at
-                and self.step % reset_interval
-                > self.num_train_data + self.config.refine_every
-            )
-            if do_densification:
-                # then we densify
-                assert (
-                    self.xys_grad_norm is not None
-                    and self.vis_counts is not None
-                    and self.max_2Dsize is not None
-                )
-                avg_grad_norm = (
-                    (self.xys_grad_norm / self.vis_counts)
-                    * 0.5
-                    * max(self.last_size[0], self.last_size[1])
-                )
-                high_grads = (avg_grad_norm > self.config.densify_grad_thresh).squeeze()
-                splits = (
-                    self.scales.exp().max(dim=-1).values
-                    > self.config.densify_size_thresh
-                ).squeeze()
-                if self.step < self.config.stop_screen_size_at:
-                    splits |= (
-                        self.max_2Dsize > self.config.split_screen_size
-                    ).squeeze()
-                splits &= high_grads
-                nsamps = self.config.n_split_samples
-                split_params = self.split_gaussians(splits, nsamps)
-
-                dups = (
-                    self.scales.exp().max(dim=-1).values
-                    <= self.config.densify_size_thresh
-                ).squeeze()
-                dups &= high_grads
-                dup_params = self.dup_gaussians(dups)
-                for name, param in self.gauss_params.items():
-                    self.gauss_params[name] = torch.nn.Parameter(
-                        torch.cat(
-                            [param.detach(), split_params[name], dup_params[name]],
-                            dim=0,
-                        )
-                    )
-                # append zeros to the max_2Dsize tensor
-                self.max_2Dsize = torch.cat(
-                    [
-                        self.max_2Dsize,
-                        torch.zeros_like(split_params["scales"][:, 0]),
-                        torch.zeros_like(dup_params["scales"][:, 0]),
-                    ],
-                    dim=0,
-                )
-
-                split_idcs = torch.where(splits)[0]
-                self.dup_in_all_optim(optimizers, split_idcs, nsamps)
-
-                dup_idcs = torch.where(dups)[0]
-                self.dup_in_all_optim(optimizers, dup_idcs, 1)
-
-                # After a guassian is split into two new gaussians, the original one should also be pruned.
-                splits_mask = torch.cat(
-                    (
-                        splits,
-                        torch.zeros(
-                            nsamps * splits.sum() + dups.sum(),
-                            device=self.device,
-                            dtype=torch.bool,
-                        ),
-                    )
-                )
-
-                deleted_mask = self.cull_gaussians(splits_mask)
-            elif (
-                self.step >= self.config.stop_split_at
-                and self.config.continue_cull_post_densification
-            ):
-                deleted_mask = self.cull_gaussians()
-            else:
-                # if we donot allow culling post refinement, no more gaussians will be pruned.
-                deleted_mask = None
-
-            if deleted_mask is not None:
-                self.remove_from_all_optim(optimizers, deleted_mask)
-
-            if (
-                self.step < self.config.stop_split_at
-                and self.step % reset_interval == self.config.refine_every
-            ):
-                # Reset value is set to be twice of the cull_alpha_thresh
-                reset_value = self.config.cull_alpha_thresh * 2.0
-                self.opacities.data = torch.clamp(
-                    self.opacities.data,
-                    max=torch.logit(
-                        torch.tensor(reset_value, device=self.device)
-                    ).item(),
-                )
-                # reset the exp of optimizer
-                optim = optimizers.optimizers["opacities"]
-                param = optim.param_groups[0]["params"][0]
-                param_state = optim.state[param]
-                param_state["exp_avg"] = torch.zeros_like(param_state["exp_avg"])
-                param_state["exp_avg_sq"] = torch.zeros_like(param_state["exp_avg_sq"])
-
-            self.xys_grad_norm = None
-            self.vis_counts = None
-            self.max_2Dsize = None
 
     def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
         # Here we explicitly use the means, scales as parameters so that the user can override this function and
@@ -467,9 +390,6 @@ class DNSplatterModel(SplatfactoModel):
             (features_dc_crop[:, None, :], features_rest_crop), dim=1
         )
 
-        BLOCK_WIDTH = (
-            16  # this controls the tile size of rasterization, 16 is a good default
-        )
         camera_scale_fac = self._get_downscale_factor()
         camera.rescale_output_resolution(1 / camera_scale_fac)
         viewmat = get_viewmat(optimized_camera_to_world)
@@ -492,9 +412,9 @@ class DNSplatterModel(SplatfactoModel):
             colors_crop = torch.sigmoid(colors_crop)
             sh_degree_to_use = None
 
-        render, alpha, info = rasterization(
+        render, alpha, self.info = rasterization(  # type: ignore[reportPossiblyUnboundVariable]
             means=means_crop,
-            quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
+            quats=quats_crop,  # rasterization does normalization internally
             scales=torch.exp(scales_crop),
             opacities=torch.sigmoid(opacities_crop).squeeze(-1),
             colors=colors_crop,
@@ -502,33 +422,32 @@ class DNSplatterModel(SplatfactoModel):
             Ks=K,  # [1, 3, 3]
             width=W,
             height=H,
-            tile_size=BLOCK_WIDTH,
             packed=False,
             near_plane=0.01,
             far_plane=1e10,
             render_mode=render_mode,
             sh_degree=sh_degree_to_use,
             sparse_grad=False,
-            absgrad=True,
+            absgrad=self.strategy.absgrad if isinstance(self.strategy, DefaultStrategy) else False,
             rasterize_mode=self.config.rasterize_mode,
             # set some threshold to disregrad small gaussians for faster rendering.
             # radius_clip=3.0,
         )
-        if self.training and info["means2d"].requires_grad:
-            info["means2d"].retain_grad()
-        self.xys = info["means2d"]  # [1, N, 2]
-        self.radii = info["radii"][0]  # [N]
+        if self.training:
+            # Feeds the strategy the means2d/radii/etc it needs for densification;
+            # this also handles the info["means2d"].retain_grad() the legacy code did by hand.
+            self.strategy.step_pre_backward(
+                self.gauss_params, self.optimizers, self.strategy_state, self.step, self.info
+            )
         alpha = alpha[:, ...]
-        self.depths = info["depths"]
-        self.conics = info["conics"]
-        self.num_tiles_hit = info["tiles_per_gauss"]
 
         background = self._get_background_color()
         rgb = render[:, ..., :3] + (1 - alpha) * background
         rgb = torch.clamp(rgb, 0.0, 1.0)
 
-        # visible gaussians
-        self.vis_indices = torch.where(self.radii > 0)[0]
+        if self.config.use_bilateral_grid and self.training:
+            if camera.metadata is not None and "cam_idx" in camera.metadata:
+                rgb = self._apply_bilateral_grid(rgb, camera.metadata["cam_idx"], H, W)
 
         if render_mode == "RGB+ED":
             depth_im = render[:, ..., 3:4]
@@ -554,25 +473,45 @@ class DNSplatterModel(SplatfactoModel):
             dots = (normals * viewdirs).sum(-1)
             negative_dot_indices = dots < 0
             normals[negative_dot_indices] = -normals[negative_dot_indices]
-            # update parameter group normals
-            self.gauss_params["normals"] = normals
+            # Keep the per-gaussian "normals" buffer in sync for mesh-extraction code
+            # (self.normals / compute_level_surface_points). This must be an in-place
+            # write, not a dict reassignment: gauss_params is the same ParameterDict the
+            # strategy grows/prunes in lockstep with means/scales/etc, so replacing the
+            # entry would desync its row count from the rest of the gaussians on the next
+            # densification step. Skipped (rather than crash) when shapes don't match,
+            # e.g. during a cropped eval-time render.
+            if normals.shape[0] == self.gauss_params["normals"].shape[0]:
+                with torch.no_grad():
+                    self.gauss_params["normals"].copy_(normals.detach())
             # convert normals from world space to camera space
             normals = normals @ camera.camera_to_worlds.squeeze(0)[:3, :3]
 
-            xys = self.xys[0, ...].detach()
-
-            normals_im: Tensor = rasterize_gaussians(  # type: ignore
-                xys,
-                self.depths[0, ...],
-                self.radii,
-                self.conics[0, ...],
-                self.num_tiles_hit[0, ...],
-                normals,
-                torch.sigmoid(opacities_crop),
-                H,
-                W,
-                BLOCK_WIDTH,
+            # gsplat's rasterize_gaussians() (legacy cuda rasterizer, pre-1.0) is gone in
+            # gsplat>=1.0; render normals as an auxiliary N-D feature via a second
+            # rasterization() call instead (sh_degree=None -> colors are treated as raw
+            # per-gaussian features, not SH coefficients). This re-projects the gaussians
+            # a second time (no projection-sharing with the RGB+depth pass above); fine
+            # at DN-Splatter's gaussian counts, revisit if profiling says otherwise.
+            normals_render, _, _ = rasterization(
+                means=means_crop,
+                quats=quats_crop,
+                scales=torch.exp(scales_crop),
+                opacities=torch.sigmoid(opacities_crop).squeeze(-1),
+                colors=normals,
+                viewmats=viewmat,
+                Ks=K,
+                width=W,
+                height=H,
+                packed=False,
+                near_plane=0.01,
+                far_plane=1e10,
+                render_mode="RGB",
+                sh_degree=None,
+                sparse_grad=False,
+                absgrad=False,
+                rasterize_mode=self.config.rasterize_mode,
             )
+            normals_im = normals_render.squeeze(0)
             # convert normals from [-1,1] to [0,1]
             normals_im = normals_im / normals_im.norm(dim=-1, keepdim=True)
             normals_im = (normals_im + 1) / 2
@@ -726,7 +665,10 @@ class DNSplatterModel(SplatfactoModel):
 
         main_loss = rgb_loss + regularization_strategy_loss
 
-        return {"main_loss": main_loss, "scale_reg": scale_reg}
+        out = {"main_loss": main_loss, "scale_reg": scale_reg}
+        if self.config.use_bilateral_grid:
+            out["tv_loss"] = 10 * total_variation_loss(self.bil_grids.grids)
+        return out
 
     def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
         """Compute and returns metrics.
@@ -925,31 +867,11 @@ class DNSplatterModel(SplatfactoModel):
 
         return metrics_dict, images_dict
 
-    def get_training_callbacks(
-        self, training_callback_attributes: TrainingCallbackAttributes
-    ) -> List[TrainingCallback]:
-        cbs = []
-        cbs.append(
-            TrainingCallback(
-                [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION], self.step_cb
-            )
-        )
-        # The order of these matters
-        cbs.append(
-            TrainingCallback(
-                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION], self.after_train
-            )
-        )
-        cbs.append(
-            TrainingCallback(
-                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
-                self.refinement_after,
-                update_every_num_iters=self.config.refine_every,
-                args=[training_callback_attributes.optimizers],
-            )
-        )
-
-        return cbs
+    # get_training_callbacks / step_post_backward / step_cb are inherited unchanged from
+    # SplatfactoModel (ns>=1.1.4): they wire step_pre_backward/step_post_backward around
+    # the strategy built in populate_modules. The old after_train/refinement_after callback
+    # pair (1.1.3-era manual split/cull/reset-alpha) is gone -- that's exactly the dead
+    # code this port removes.
 
     def sample_points_in_gaussians(
         self,
@@ -1598,6 +1520,32 @@ def matrix_to_quaternion(rotation_matrix: Tensor):
             [w, x, y, z], dtype=matrix.dtype, device=matrix.device
         )
     return quaternion
+
+
+def quat_to_rotmat(quat: Tensor) -> Tensor:
+    """Quaternion (wxyz, unnormalized ok) -> rotation matrix (..., 3, 3).
+
+    Vendored from gsplat 1.0.0's cuda_legacy._torch_impl (module deleted in
+    gsplat 1.4.0). Normalizes first, exactly like the original — callers here
+    pass raw optimized quats.
+    """
+    assert quat.shape[-1] == 4, quat.shape
+    w, x, y, z = torch.unbind(F.normalize(quat, dim=-1), dim=-1)
+    mat = torch.stack(
+        [
+            1 - 2 * (y**2 + z**2),
+            2 * (x * y - w * z),
+            2 * (x * z + w * y),
+            2 * (x * y + w * z),
+            1 - 2 * (x**2 + z**2),
+            2 * (y * z - w * x),
+            2 * (x * z - w * y),
+            2 * (y * z + w * x),
+            1 - 2 * (x**2 + y**2),
+        ],
+        dim=-1,
+    )
+    return mat.reshape(quat.shape[:-1] + (3, 3))
 
 
 def scale_rot_to_inv_cov3d(scale, quat, return_sqrt=False):
