@@ -155,7 +155,8 @@ dn_splatter_big = MethodSpecification(
             ),
             model=DNSplatterModelConfig(
                 cull_alpha_thresh=0.005,
-                continue_cull_post_densification=False,
+                # continue_cull_post_densification was deleted with the 1.1.3-era
+                # densification code; culling behavior now lives in the strategy
             ),
         ),
         optimizers={
