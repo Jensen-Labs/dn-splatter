@@ -177,8 +177,8 @@ class DNSplatterModel(SplatfactoModel):
         self.rgb_metrics = RGBMetrics()
         self.depth_metrics = DepthMetrics()
         self.normal_metrics = NormalMetrics()
+        # ns-main's k_nearest_sklearn returns Tensors (1.1.3's returned numpy)
         distances, indices = k_nearest_sklearn(means.data, 3)
-        distances = torch.from_numpy(distances)
         # find the average of the three nearest neighbors for each point and use that as the scale
         avg_dist = distances.mean(dim=-1, keepdim=True)
 
